@@ -1,0 +1,96 @@
+const winston = require("winston");
+require("winston-daily-rotate-file");
+const Log = require("../shared-models/models/Log.js");
+
+const { combine, timestamp, printf } = winston.format;
+
+// Custom log message format with timestamp and metadata
+const logMessageFormat = printf(({ level, message, timestamp, ...meta }) => {
+  const metaString = Object.keys(meta).length ? JSON.stringify(meta) : "";
+  return `${timestamp} - ${level}: ${message} ${metaString}`;
+});
+
+// File rotation transport (daily rotation with max size)
+const fileRotateTransport = (level) =>
+  new winston.transports.DailyRotateFile({
+    level,
+    filename: "logs" + `/${level}-%DATE%.log`,
+    datePattern: "YYYY-MM-DD",
+    maxSize: "10m",
+  });
+
+// Creating the Winston logger with transports
+const logger = winston.createLogger({
+  format: combine(timestamp(), logMessageFormat),
+  transports: [
+    new winston.transports.Console(),
+    fileRotateTransport("info"),
+    fileRotateTransport("error"),
+  ],
+});
+
+// Function to build log details from req and res
+const buildLogDetails = (req, res, error = null, responseMessage = null) => {
+  return {
+    endpoint: req.originalUrl,
+    method: req.method,
+    ip: req.get("x-forwarded-for") || req.socket.remoteAddress,
+    timestamp: new Date(),
+    status: res.statusCode >= 400 ? "Error" : "Success",
+    browser: req.get("User-Agent"),
+    response: responseMessage || null,
+  };
+};
+
+// Logger middleware function to log request and response globally
+const loggerMiddleware = (req, res, next) => {
+  const incomingMessage = "Incoming request";
+
+  // Log the request details without the response when the request is received
+  logger.log({
+    level: "info",
+    message: incomingMessage,
+    ...buildLogDetails(req, res),
+  });
+
+  // Store the response message in a variable
+  let responseMessage = null;
+
+  // Intercept the response to capture the response data
+  const originalJson = res.json;
+  res.json = function (data) {
+    // Set responseMessage before sending the response
+    responseMessage = data.message || data.error || "No message";
+
+    // Call the original res.json function with the data
+    originalJson.call(this, data);
+  };
+
+  // Listen for the response to finish and log the details
+  res.on("finish", async () => {
+    const logDetails = buildLogDetails(req, res, null, responseMessage);
+
+    logger.log({
+      level: res.statusCode >= 400 ? "error" : "info",
+      message: responseMessage || "Request completed",
+      ...logDetails,
+    });
+
+    const logEntry = new Log(logDetails);
+    try {
+      await logEntry.save();
+    } catch (dbError) {
+      const errorLogDetails = buildLogDetails(
+        req,
+        res,
+        `Failed to save log to database: ${dbError.message}`,
+        responseMessage
+      );
+      logger.error(errorLogDetails.message, errorLogDetails);
+    }
+  });
+
+  next();
+};
+
+module.exports = { logger, loggerMiddleware };
